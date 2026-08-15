@@ -61,7 +61,41 @@ let config = {
     // HIGHLIGHT_COMPRESSION = 0 gives the old hard-clip look, 1 = full effect.
     HIGHLIGHT_COMPRESSION: 0.75,
     HIGHLIGHT_KNEE: 0.9,
+    // Microphone reactivity (optional — off until enabled from the UI or M).
+    // Mic input is analysed each frame into log-spaced frequency bands; the
+    // overall level paints ambient splats and a bass beat-detector fires a
+    // central shockwave + bloom flash on each hit.
+    MIC_ENABLED: false,
+    MIC_SENSITIVITY: 1.0,   // 0..3 overall gain on the analysed level
+    MIC_AMBIENT: 1.0,       // 0..2 how much ambient fluid the mic paints
+    MIC_BASS_BOOST: 1.0,    // 0..3 how hard the bass beats hit
+    MIC_MAX_AMBIENT: 6,     // max ambient splats/frame at full level
 }
+
+// ── Microphone reactivity state ──────────────────────────────────────
+// Declared before the animation loop starts so the first frame never hits a
+// temporal-dead-zone on `mic`. All mic logic lives at the bottom of the file.
+const MIC_BANDS = 24;
+let mic = {
+    active: false,
+    ctx: null,
+    stream: null,
+    analyser: null,
+    data: null,
+    level: 0,
+    bass: 0,
+    bands: new Float32Array(MIC_BANDS),
+    bandsSm: new Float32Array(MIC_BANDS),
+    beatHistory: [],
+    lastBeatTime: 0,
+    pulse: 0,
+    bloomBoost: 0,
+    t: 0,
+    attractors: [0, 2.1, 4.2],
+    viz: null,          // 2d context for the spectrum overlay
+    indicator: null,    // DOM status pill
+    btn: null,          // DOM mic toggle button
+};
 
 function pointerPrototype () {
     this.id = -1;
@@ -208,6 +242,14 @@ function startGUI () {
     let highlightsFolder = gui.addFolder('Highlights');
     highlightsFolder.add(config, 'HIGHLIGHT_COMPRESSION', 0.0, 1.0).name('compression').step(0.01);
     highlightsFolder.add(config, 'HIGHLIGHT_KNEE', 0.5, 0.95).name('knee').step(0.01);
+
+    let micFolder = gui.addFolder('Microphone');
+    micFolder.add(config, 'MIC_ENABLED').name('mic active').listen(); // read-only status
+    micFolder.add(config, 'MIC_SENSITIVITY', 0.0, 3.0).name('sensitivity').step(0.05);
+    micFolder.add(config, 'MIC_AMBIENT', 0.0, 2.0).name('ambient flow').step(0.05);
+    micFolder.add(config, 'MIC_BASS_BOOST', 0.0, 3.0).name('bass boost').step(0.05);
+    micFolder.add({ fun: () => toggleMic() }, 'fun').name('toggle (M)');
+    micFolder.open();
 
     let sunraysFolder = gui.addFolder('Sunrays');
     sunraysFolder.add(config, 'SUNRAYS').name('enabled').onFinishChange(updateKeywords);
@@ -1155,9 +1197,11 @@ function update () {
         initFramebuffers();
     updateColors(dt);
     applyInputs();
+    updateMic(dt);
     if (!config.PAUSED)
         step(dt);
     render(null);
+    drawMicViz();
     requestAnimationFrame(update);
 }
 
@@ -1175,6 +1219,7 @@ function resizeCanvas () {
     if (canvas.width != width || canvas.height != height) {
         canvas.width = width;
         canvas.height = height;
+        syncMicCanvasSize();
         return true;
     }
     return false;
@@ -1202,6 +1247,159 @@ function applyInputs () {
             splatPointer(p);
         }
     });
+}
+
+// ── Microphone reactivity ────────────────────────────────────────────
+// updateMic() samples the mic once per frame, converts the FFT into
+// log-spaced bands, drives ambient splats from the overall level, and runs a
+// bass beat-detector that fires a central shockwave + bloom flash on each hit.
+// Everything is a no-op while config.MIC_ENABLED is false (cheap branch).
+
+function updateMic (dt) {
+    if (!mic.active) {
+        mic.pulse *= Math.max(0.0, 1.0 - dt * 6.0);
+        mic.bloomBoost *= Math.max(0.0, 1.0 - dt * 4.0);
+        if (mic.bloomBoost < 0.002) mic.bloomBoost = 0;
+        return;
+    }
+
+    const a = mic.analyser;
+    if (!a) return;
+    a.getByteFrequencyData(mic.data);
+
+    const n = a.frequencyBinCount;
+    const sr = a.context.sampleRate || 44100;
+    const hzPerBin = sr / 2 / n;
+    const bassEnd = 160; // Hz
+
+    // Overall RMS-ish level: average the whole spectrum, normalised to 0..1.
+    let sum = 0;
+    for (let i = 0; i < n; i++) sum += mic.data[i];
+    let level = sum / n / 255;
+
+    // Bass energy: average only the low bins.
+    const bassBins = Math.max(1, Math.floor(bassEnd / hzPerBin));
+    let bassSum = 0;
+    for (let i = 0; i < bassBins; i++) bassSum += mic.data[i];
+    let bass = bassSum / bassBins / 255;
+
+    level *= config.MIC_SENSITIVITY;
+    bass *= config.MIC_SENSITIVITY;
+    level = Math.min(level, 1.5);
+    bass = Math.min(bass, 1.5);
+
+    // Log-spaced bands (bass → treble) for the visualiser, smoothed a little.
+    // Each band maps to an integer bin range guaranteed to span >= 1 bin so
+    // the average is always defined (no empty ranges / NaN).
+    const fMin = 40, fMax = 8000;
+    const binStart = Math.max(1, Math.floor(fMin / hzPerBin));
+    const binEnd = Math.max(binStart + 1, Math.min(n - 1, Math.floor(fMax / hzPerBin)));
+    for (let b = 0; b < MIC_BANDS; b++) {
+        const lo = Math.floor(binStart + (binEnd - binStart) * (b / MIC_BANDS));
+        const hi = Math.max(lo + 1, Math.floor(binStart + (binEnd - binStart) * ((b + 1) / MIC_BANDS)));
+        let s = 0, c = 0;
+        for (let i = lo; i < hi; i++) { s += mic.data[i]; c++; }
+        const v = c ? s / c / 255 : 0;
+        mic.bands[b] = v;
+        mic.bandsSm[b] += (v - mic.bandsSm[b]) * 0.25;
+    }
+
+    mic.level = level;
+    mic.bass = bass;
+
+    // Beat detection: bass must exceed a rolling average AND cross a
+    // refractory window so a sustained chord doesn't fire every frame.
+    mic.beatHistory.push(bass);
+    if (mic.beatHistory.length > 45) mic.beatHistory.shift(); // ~0.75s @60fps
+    const avg = mic.beatHistory.reduce((x, y) => x + y, 0) / mic.beatHistory.length;
+    const now = performance.now();
+    if (bass > 0.12 && bass > avg * 1.45 && (now - mic.lastBeatTime) > 170) {
+        mic.lastBeatTime = now;
+        const strength = Math.min(1.0, (bass - avg)) * config.MIC_BASS_BOOST;
+        fireMicBeat(strength);
+    }
+
+    // Decay the one-shot pulse each frame.
+    mic.pulse *= Math.max(0.0, 1.0 - dt * 5.0);
+    mic.bloomBoost *= Math.max(0.0, 1.0 - dt * 4.0);
+
+    // Ambient painting driven by level (independent of the pointer).
+    const ambient = level * config.MIC_AMBIENT * config.MIC_MAX_AMBIENT;
+    const count = Math.floor(ambient);
+    const frac = ambient - count;
+    if (!config.PAUSED) {
+        for (let i = 0; i < count; i++) micAmbientSplat();
+        if (frac > Math.random()) micAmbientSplat();
+    }
+}
+
+// One ambient splat: a drifting attractor point (three of them, Lissajous
+// paths offset by phase) so the fluid keeps moving even when the user is idle.
+function micAmbientSplat () {
+    mic.t += 1 / 60;
+    const i = Math.floor(Math.random() * mic.attractors.length);
+    const ph = mic.attractors[i];
+    const x = 0.5 + 0.34 * Math.sin(mic.t * 0.6 + ph);
+    const y = 0.5 + 0.30 * Math.cos(mic.t * 0.85 + ph * 1.3);
+    const spd = 600 + mic.level * 2200;
+    const dx = spd * (Math.random() - 0.5);
+    const dy = spd * (Math.random() - 0.5);
+    let c = generateColor();
+    c.r *= 2.2; c.g *= 2.2; c.b *= 2.2;
+    splat(x, y, dx, dy, c);
+}
+
+// Beat hit: a bright, fast central burst (a shockwave) plus a bloom flash.
+function fireMicBeat (strength) {
+    if (strength <= 0) return;
+    const k = 0.4 + 0.6 * Math.min(1.0, strength);
+    const n = 2 + Math.floor(3 * k);
+    for (let i = 0; i < n; i++) {
+        let c = generateColor();
+        c.r *= 6 * k; c.g *= 6 * k; c.b *= 6 * k;
+        // Radial outward kick from center for a shockwave feel.
+        const ang = Math.random() * Math.PI * 2;
+        const mag = 1400 + 2600 * k;
+        splat(0.5, 0.5, Math.cos(ang) * mag, Math.sin(ang) * mag, c);
+    }
+    mic.pulse = Math.min(1.0, mic.pulse + 0.5 + 0.5 * k);
+    mic.bloomBoost = Math.min(1.5, mic.bloomBoost + 0.6 + 0.8 * k);
+    if (mic.indicator) {
+        mic.indicator.classList.add('beat');
+        clearTimeout(mic._beatT);
+        mic._beatT = setTimeout(() => mic.indicator.classList.remove('beat'), 120);
+    }
+}
+
+// The spectrum overlay, bottom-centre: log-spaced neon bars (bass left →
+// treble right) that rise with the smoothed bands.
+function drawMicViz () {
+    const viz = mic.viz;
+    if (!viz) return;
+    const W = canvas.width, H = canvas.height;
+    viz.clearRect(0, 0, W, H);
+    if (!config.MIC_ENABLED) return;
+
+    const barW = Math.max(3, W / (MIC_BANDS * 2.4));
+    const gap = barW * 0.6;
+    const totalW = MIC_BANDS * barW + (MIC_BANDS - 1) * gap;
+    const left = (W - totalW) / 2;
+    const baseY = H - Math.max(24, H * 0.04);
+    const maxH = Math.max(60, H * 0.16);
+
+    for (let b = 0; b < MIC_BANDS; b++) {
+        const v = Math.min(1.0, mic.bandsSm[b] * 1.4);
+        const h = Math.max(2, v * maxH);
+        const x = left + b * (barW + gap);
+        const hue = (b / MIC_BANDS) * 300; // 0=red ... 300=magenta
+        const g = viz.createLinearGradient(0, baseY - h, 0, baseY);
+        g.addColorStop(0, `hsla(${hue}, 100%, 70%, 0.95)`);
+        g.addColorStop(1, `hsla(${hue}, 100%, 45%, 0.25)`);
+        viz.fillStyle = g;
+        viz.shadowColor = `hsla(${hue}, 100%, 60%, 0.8)`;
+        viz.shadowBlur = 12;
+        viz.fillRect(x, baseY - h, barW, h);
+    }
 }
 
 function step (dt) {
@@ -1372,7 +1570,7 @@ function applyBloom (source, destination) {
     bloomFinalProgram.bind();
     gl.uniform2f(bloomFinalProgram.uniforms.texelSize, last.texelSizeX, last.texelSizeY);
     gl.uniform1i(bloomFinalProgram.uniforms.uTexture, last.attach(0));
-    gl.uniform1f(bloomFinalProgram.uniforms.intensity, config.BLOOM_INTENSITY);
+    gl.uniform1f(bloomFinalProgram.uniforms.intensity, config.BLOOM_INTENSITY + mic.bloomBoost);
     blit(destination);
 }
 
@@ -1506,6 +1704,8 @@ window.addEventListener('touchend', e => {
 window.addEventListener('keydown', e => {
     if (e.code === 'KeyP')
         config.PAUSED = !config.PAUSED;
+    if (e.code === 'KeyM')
+        toggleMic();
     if (e.key === ' ')
         splatStack.push(parseInt(Math.random() * 20) + 5);
 });
@@ -1630,4 +1830,116 @@ function hashCode (s) {
         hash |= 0; // Convert to 32bit integer
     }
     return hash;
-};
+}
+
+// ── Microphone control ───────────────────────────────────────────────
+// toggleMic() is the single entry point (M key, GUI, or the on-screen
+// button). It requests the mic on first use, tears everything down on
+// disable, and keeps the config flag / indicator / overlay in sync.
+
+async function toggleMic () {
+    if (mic.active || mic.stream) {
+        await disableMic();
+    } else {
+        await enableMic();
+    }
+    syncMicState();
+}
+
+async function enableMic () {
+    if (!mic.ctx) {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        mic.ctx = new AC();
+    }
+    if (mic.ctx.state === 'suspended') {
+        try { await mic.ctx.resume(); } catch (e) {}
+    }
+    if (!mic.stream) {
+        try {
+            mic.stream = await navigator.mediaDevices.getUserMedia({
+                audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+            });
+        } catch (err) {
+            setMicIndicator('denied', 'Mic denied');
+            return;
+        }
+    }
+    mic.analyser = mic.ctx.createAnalyser();
+    mic.analyser.fftSize = 1024;           // 512 bins, ~43Hz resolution @44.1k
+    mic.analyser.smoothingTimeConstant = 0.55;
+    const src = mic.ctx.createMediaStreamSource(mic.stream);
+    src.connect(mic.analyser);
+    mic.data = new Uint8Array(mic.analyser.frequencyBinCount);
+    mic.active = true;
+    config.MIC_ENABLED = true;
+    setMicIndicator('live', 'Mic live');
+}
+
+async function disableMic () {
+    mic.active = false;
+    config.MIC_ENABLED = false;
+    if (mic.stream) {
+        mic.stream.getTracks().forEach(t => t.stop());
+        mic.stream = null;
+    }
+    mic.analyser = null;
+    mic.bass = 0; mic.level = 0;
+    mic.bandsSm.fill(0);
+    mic.pulse = 0; mic.bloomBoost = 0;
+    setMicIndicator('off', 'Mic off');
+}
+
+// Keep the visual state consistent with the config flag (also catches the
+// case where the GUI checkbox was flipped directly).
+function syncMicState () {
+    if (config.MIC_ENABLED && !mic.active) {
+        enableMic().then(syncMicState);
+    } else if (!config.MIC_ENABLED && mic.active) {
+        disableMic();
+    }
+}
+
+function setMicIndicator (state, label) {
+    if (!mic.indicator) return;
+    mic.indicator.className = 'mic-indicator ' + state;
+    mic.indicator.textContent = label;
+}
+
+// Build the on-screen status pill + spectrum overlay (idempotent).
+function initMicUI () {
+    if (mic.indicator) return;
+
+    const wrap = document.createElement('div');
+    wrap.id = 'mic-ui';
+    document.body.appendChild(wrap);
+
+    mic.indicator = document.createElement('div');
+    mic.indicator.className = 'mic-indicator off';
+    mic.indicator.textContent = 'Mic off';
+    wrap.appendChild(mic.indicator);
+
+    mic.btn = document.createElement('button');
+    mic.btn.className = 'mic-btn';
+    mic.btn.title = 'Toggle microphone (M)';
+    mic.btn.textContent = '🎙 mic';
+    mic.btn.addEventListener('click', () => toggleMic());
+    wrap.appendChild(mic.btn);
+
+    const vizCanvas = document.createElement('canvas');
+    vizCanvas.className = 'mic-viz';
+    document.body.appendChild(vizCanvas);
+    mic.viz = vizCanvas.getContext('2d');
+    syncMicCanvasSize();
+}
+
+function syncMicCanvasSize () {
+    if (!mic.viz) return;
+    const vc = mic.viz.canvas;
+    if (vc.width !== canvas.width || vc.height !== canvas.height) {
+        vc.width = canvas.width;
+        vc.height = canvas.height;
+    }
+}
+
+// Run after the DOM + config are ready.
+initMicUI();
