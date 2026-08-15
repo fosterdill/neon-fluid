@@ -95,6 +95,7 @@ let mic = {
     viz: null,          // 2d context for the spectrum overlay
     indicator: null,    // DOM status pill
     btn: null,          // DOM mic toggle button
+    _readoutAcc: 0,     // throttle for the live level text update
 };
 
 function pointerPrototype () {
@@ -1264,6 +1265,27 @@ function updateMic (dt) {
 
     const a = mic.analyser;
     if (!a) return;
+
+    // Self-heal: browsers auto-suspend the AudioContext when the tab loses
+    // focus / the machine sleeps. A suspended context hands the analyser an
+    // all-zero FFT — which looks exactly like "mic enabled but it hears
+    // nothing". If we notice it suspended, nudge it awake (resume is a no-op
+    // when already running) so the next read has real data.
+    const actx = a.context;
+    if (actx && actx.state === 'suspended') {
+        // No user gesture here — this may be denied by autoplay policy, so
+        // also flag it in the indicator; a real click/keypress will arm the
+        // resume via the pointer/key handlers below.
+        try { const p = actx.resume(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+        if (!mic._suspendedNoted) {
+            mic._suspendedNoted = true;
+            setMicIndicator('suspended', 'Mic: click to wake');
+        }
+    } else if (mic._suspendedNoted) {
+        mic._suspendedNoted = false;
+        if (mic.active) updateMicReadout();
+    }
+
     a.getByteFrequencyData(mic.data);
 
     const n = a.frequencyBinCount;
@@ -1330,6 +1352,29 @@ function updateMic (dt) {
         for (let i = 0; i < count; i++) micAmbientSplat();
         if (frac > Math.random()) micAmbientSplat();
     }
+
+    updateMicReadout();
+}
+
+// Throttled (~10Hz) live level readout on the status pill. This is the
+// diagnostic that tells you whether signal is actually arriving: a moving
+// percentage means the mic is working; a frozen 0% means the input is
+// muted / not the active default device (a browser- or OS-level issue the
+// page can't fix).
+function updateMicReadout () {
+    if (!mic.indicator || !config.MIC_ENABLED) return;
+    mic._readoutAcc += 1 / 60;
+    if (mic._readoutAcc < 0.1) return;
+    mic._readoutAcc = 0;
+    const pct = Math.round(Math.min(1.0, mic.level) * 100);
+    let cls = 'live';
+    // Persistent 0% while active = hearing nothing (muted input / wrong device).
+    if (pct === 0) cls = 'silent';
+    if (mic._suspendedNoted) cls = 'suspended';
+    mic.indicator.className = 'mic-indicator ' + cls;
+    mic.indicator.textContent = (cls === 'suspended')
+        ? 'Mic: click to wake'
+        : 'Mic ' + pct + '%';
 }
 
 // One ambient splat: a drifting attractor point (three of them, Lissajous
@@ -1648,6 +1693,7 @@ function correctRadius (radius) {
 let hintEl = document.getElementById('hint');
 
 canvas.addEventListener('mousedown', e => {
+    armAudioContext();
     if (hintEl) hintEl.classList.add('hidden');
     let posX = scaleByPixelRatio(e.offsetX);
     let posY = scaleByPixelRatio(e.offsetY);
@@ -1705,6 +1751,7 @@ window.addEventListener('touchend', e => {
 });
 
 window.addEventListener('keydown', e => {
+    armAudioContext();
     if (e.code === 'KeyP')
         config.PAUSED = !config.PAUSED;
     if (e.code === 'KeyM')
@@ -1854,7 +1901,7 @@ async function enableMic () {
         const AC = window.AudioContext || window.webkitAudioContext;
         mic.ctx = new AC();
     }
-    if (mic.ctx.state === 'suspended') {
+    if (mic.ctx.state !== 'running') {
         try { await mic.ctx.resume(); } catch (e) {}
     }
     if (!mic.stream) {
@@ -1875,7 +1922,16 @@ async function enableMic () {
     mic.data = new Uint8Array(mic.analyser.frequencyBinCount);
     mic.active = true;
     config.MIC_ENABLED = true;
-    setMicIndicator('live', 'Mic live');
+    mic._suspendedNoted = false;
+    // Surface the real context state. If it's not 'running' the browser will
+    // refuse to produce FFT data until a user gesture (handled by
+    // armAudioContext), so tell the user to click the page.
+    if (mic.ctx.state !== 'running') {
+        setMicIndicator('suspended', 'Mic: click to wake');
+        mic._suspendedNoted = true;
+    } else {
+        setMicIndicator('live', 'Mic live');
+    }
 }
 
 async function disableMic () {
@@ -1889,6 +1945,7 @@ async function disableMic () {
     mic.bass = 0; mic.level = 0;
     mic.bandsSm.fill(0);
     mic.pulse = 0; mic.bloomBoost = 0;
+    mic._suspendedNoted = false;
     setMicIndicator('off', 'Mic off');
 }
 
@@ -1906,6 +1963,22 @@ function setMicIndicator (state, label) {
     if (!mic.indicator) return;
     mic.indicator.className = 'mic-indicator ' + state;
     mic.indicator.textContent = label;
+}
+
+// Called from real user-gesture handlers (click / keypress). The browser only
+// lets us resume an AudioContext inside a gesture, so this is the reliable way
+// to wake a context that auto-suspended. No-op if there's no context or it's
+// already running.
+function armAudioContext () {
+    if (!mic.ctx) return;
+    if (mic.ctx.state === 'suspended') {
+        try {
+            const p = mic.ctx.resume();
+            if (p && p.then) {
+                p.then(() => { mic._suspendedNoted = false; }).catch(() => {});
+            }
+        } catch (e) {}
+    }
 }
 
 // Build the on-screen status pill + spectrum overlay (idempotent).
