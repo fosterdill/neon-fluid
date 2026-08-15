@@ -1219,7 +1219,6 @@ function resizeCanvas () {
     if (canvas.width != width || canvas.height != height) {
         canvas.width = width;
         canvas.height = height;
-        syncMicCanvasSize();
         return true;
     }
     return false;
@@ -1376,6 +1375,10 @@ function fireMicBeat (strength) {
 function drawMicViz () {
     const viz = mic.viz;
     if (!viz) return;
+    // Keep the overlay's internal resolution in sync with the fluid canvas.
+    // This runs every frame (long after `mic` is initialised), so it also
+    // self-heals on window resize — no need to touch it from resizeCanvas.
+    syncMicCanvasSize();
     const W = canvas.width, H = canvas.height;
     viz.clearRect(0, 0, W, H);
     if (!config.MIC_ENABLED) return;
