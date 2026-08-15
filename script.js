@@ -49,12 +49,18 @@ let config = {
     BLOOM: true,
     BLOOM_ITERATIONS: 8,
     BLOOM_RESOLUTION: 256,
-    BLOOM_INTENSITY: 1.2,
-    BLOOM_THRESHOLD: 0.35,
-    BLOOM_SOFT_KNEE: 0.7,
+    BLOOM_INTENSITY: 0.95,
+    BLOOM_THRESHOLD: 0.5,
+    BLOOM_SOFT_KNEE: 1.0,
     SUNRAYS: true,
     SUNRAYS_RESOLUTION: 196,
     SUNRAYS_WEIGHT: 1.0,
+    // Highlight tonemap: a filmic-style shoulder (see displayShader) that pulls
+    // clipped highlights down to a smooth rolloff instead of a flat white blob.
+    // HIGHLIGHT_KNEE is where the shoulder begins; lower = more dynamic range.
+    // HIGHLIGHT_COMPRESSION = 0 gives the old hard-clip look, 1 = full effect.
+    HIGHLIGHT_COMPRESSION: 0.75,
+    HIGHLIGHT_KNEE: 0.9,
 }
 
 function pointerPrototype () {
@@ -198,6 +204,10 @@ function startGUI () {
     bloomFolder.add(config, 'BLOOM').name('enabled').onFinishChange(updateKeywords);
     bloomFolder.add(config, 'BLOOM_INTENSITY', 0.1, 2.0).name('intensity');
     bloomFolder.add(config, 'BLOOM_THRESHOLD', 0.0, 1.0).name('threshold');
+
+    let highlightsFolder = gui.addFolder('Highlights');
+    highlightsFolder.add(config, 'HIGHLIGHT_COMPRESSION', 0.0, 1.0).name('compression').step(0.01);
+    highlightsFolder.add(config, 'HIGHLIGHT_KNEE', 0.5, 0.95).name('knee').step(0.01);
 
     let sunraysFolder = gui.addFolder('Sunrays');
     sunraysFolder.add(config, 'SUNRAYS').name('enabled').onFinishChange(updateKeywords);
@@ -502,10 +512,29 @@ const displayShaderSource = `
     uniform sampler2D uDithering;
     uniform vec2 ditherScale;
     uniform vec2 texelSize;
+    uniform float uHighlightKnee;
 
     vec3 linearToGamma (vec3 color) {
         color = max(color, vec3(0));
         return max(1.055 * pow(color, vec3(0.416666667)) - 0.055, vec3(0));
+    }
+
+    // Filmic-style highlight shoulder. Identity below the knee (slope 1), then a
+    // smoothstep-blended exponential rolloff that asymptotes to 1.0. Pulls
+    // blown highlights back so the peak hits full white while everything under
+    // it keeps a smooth gradient (more dynamic range) instead of a flat white
+    // blob. C1-continuous, so no visible kink. Mids/shadows untouched.
+    float highlightKnee (float x, float x0) {
+        float s = max(1.0 - x0, 0.05);          // asymptote height (>= knee)
+        float zone = max(0.5 - 0.2 * x0, 0.15); // smoothstep transition width
+        float t = clamp((x - x0) / zone, 0.0, 1.0);
+        float w = t * t * (3.0 - 2.0 * t);
+        float rolloff = s * (1.0 - exp(-(x - x0) / max(s, 0.05)));
+        return min((1.0 - w) * min(x, 1.0) + w * (x0 + rolloff), 1.0);
+    }
+
+    vec3 applyHighlightKnee (vec3 c, float x0) {
+        return vec3(highlightKnee(c.r, x0), highlightKnee(c.g, x0), highlightKnee(c.b, x0));
     }
 
     void main () {
@@ -546,6 +575,13 @@ const displayShaderSource = `
         bloom = linearToGamma(bloom);
         c += bloom;
     #endif
+
+        // Highlight shoulder: a smooth rolloff that tames clipped highlights so
+        // the peak reaches full white while everything under it keeps a gradient
+        // (more dynamic range) instead of a flat white blob. The effective knee
+        // (uHighlightKnee) is set from HIGHLIGHT_KNEE / HIGHLIGHT_COMPRESSION in
+        // JS. Identity below the knee, so mids and shadows are untouched.
+        c = applyHighlightKnee(c, uHighlightKnee);
 
         float a = max(c.r, max(c.g, c.b));
         gl_FragColor = vec4(c, a);
@@ -1284,6 +1320,13 @@ function drawDisplay (target) {
     }
     if (config.SUNRAYS)
         gl.uniform1i(displayMaterial.uniforms.uSunrays, sunrays.attach(3));
+    if (displayMaterial.uniforms.uHighlightKnee != null) {
+        // Baked effective knee: compression=0 -> knee 1.0 (old hard-clip look),
+        // compression=1 -> HIGHLIGHT_KNEE (full shoulder). Always <= 1.0, so the
+        // shoulder can never push values back over the white point (no re-clip).
+        const effKnee = config.HIGHLIGHT_KNEE + (1.0 - config.HIGHLIGHT_KNEE) * (1.0 - config.HIGHLIGHT_COMPRESSION);
+        gl.uniform1f(displayMaterial.uniforms.uHighlightKnee, effKnee);
+    }
     blit(target);
 }
 
