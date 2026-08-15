@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="Cache-Control" content="no-cache">
+
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <meta name="mobile-web-app-capable" content="yes">
+
+        <title>Neon Fluid</title>
+        <meta name="description" content="A black screen that bleeds neon. Click, drag, and paint with glowing fluid.">
+
+        <meta property="og:type" content="website">
+        <meta property="og:title" content="Neon Fluid">
+        <meta property="og:description" content="A black screen that bleeds neon. Click, drag, and paint with glowing fluid.">
+
+        <script type="text/javascript" src="dat.gui.min.js"></script>
+        <style>
+            * {
+                user-select: none;
+                -webkit-user-select: none;
+            }
+
+            html, body {
+                overflow: hidden;
+                background-color: #000;
+            }
+
+            body {
+                margin: 0;
+                position: fixed;
+                width: 100%;
+                height: 100%;
+            }
+
+            canvas {
+                width: 100%;
+                height: 100%;
+                display: block;
+                cursor: crosshair;
+            }
+
+            /* dat.GUI — hidden by default (press H to toggle) */
+            .dg.main {
+                z-index: 10;
+            }
+
+            /* Fading center hint */
+            #hint {
+                position: fixed;
+                top: 50%;
+                left: 50%;
+                transform: translate(-50%, -50%);
+                pointer-events: none;
+                text-align: center;
+                color: rgba(255, 255, 255, 0.55);
+                font-family: "SF Pro Display", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                font-weight: 200;
+                letter-spacing: 0.35em;
+                text-transform: uppercase;
+                z-index: 5;
+                transition: opacity 1.2s ease-out;
+            }
+
+            #hint .big {
+                font-size: 1.6vw;
+                text-shadow:
+                    0 0 10px rgba(0, 255, 255, 0.8),
+                    0 0 30px rgba(255, 0, 255, 0.5);
+                animation: pulse 3s ease-in-out infinite;
+            }
+
+            #hint .small {
+                margin-top: 14px;
+                font-size: 0.85vw;
+                letter-spacing: 0.5em;
+                color: rgba(255, 255, 255, 0.3);
+            }
+
+            #hint.hidden {
+                opacity: 0;
+            }
+
+            @keyframes pulse {
+                0%, 100% { opacity: 0.45; }
+                50%      { opacity: 1; }
+            }
+        </style>
+    </head>
+    <body>
+        <canvas></canvas>
+
+        <div id="hint">
+            <div class="big">Drag to Paint</div>
+            <div class="small">Neon Fluid</div>
+        </div>
+
+        <script src="./script.js"></script>
+    </body>
+</html>
