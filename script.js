@@ -95,6 +95,7 @@ let mic = {
     viz: null,          // 2d context for the spectrum overlay
     indicator: null,    // DOM status pill
     btn: null,          // DOM mic toggle button
+    timeDomain: null,   // Uint8Array for getByteTimeDomainData (RMS level)
     _readoutAcc: 0,     // throttle for the live level text update
 };
 
@@ -1293,12 +1294,28 @@ function updateMic (dt) {
     const hzPerBin = sr / 2 / n;
     const bassEnd = 160; // Hz
 
-    // Overall RMS-ish level: average the whole spectrum, normalised to 0..1.
-    let sum = 0;
-    for (let i = 0; i < n; i++) sum += mic.data[i];
-    let level = sum / n / 255;
+    // Overall level = time-domain RMS loudness. Averaging all FFT bins is a
+    // poor loudness proxy (most bins sit near zero, so music reads as quiet
+    // and barely paints). RMS of the waveform is the standard visualizer
+    // metric: it tracks perceived volume directly and reacts on every frame.
+    let level = 0;
+    if (mic.timeDomain) {
+        a.getByteTimeDomainData(mic.timeDomain);
+        let sq = 0;
+        for (let i = 0; i < mic.timeDomain.length; i++) {
+            const v = (mic.timeDomain[i] - 128) / 128; // -1..1
+            sq += v * v;
+        }
+        level = Math.sqrt(sq / mic.timeDomain.length);
+        level *= 1.6; // RMS of typical speech/music sits ~0.15-0.4; lift it
+    } else {
+        // Fallback if the time-domain buffer wasn't allocated.
+        let sum = 0;
+        for (let i = 0; i < n; i++) sum += mic.data[i];
+        level = (sum / n / 255) * 1.4;
+    }
 
-    // Bass energy: average only the low bins.
+    // Bass energy: average only the low bins (kept for the beat detector).
     const bassBins = Math.max(1, Math.floor(bassEnd / hzPerBin));
     let bassSum = 0;
     for (let i = 0; i < bassBins; i++) bassSum += mic.data[i];
@@ -1920,6 +1937,7 @@ async function enableMic () {
     const src = mic.ctx.createMediaStreamSource(mic.stream);
     src.connect(mic.analyser);
     mic.data = new Uint8Array(mic.analyser.frequencyBinCount);
+    mic.timeDomain = new Uint8Array(mic.analyser.fftSize); // for RMS level
     mic.active = true;
     config.MIC_ENABLED = true;
     mic._suspendedNoted = false;
